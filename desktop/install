@@ -1,0 +1,372 @@
+#!/usr/bin/env bash
+#
+# Plugsky Desktop installer
+# --------------------------
+# Installs Plugsky Desktop — a native AI chat client for your computer.
+# Built on the open-source Jan project (Apache-2.0, github.com/menloresearch/jan).
+#
+# Usage:
+#   curl -fsSL https://plugsky.com/install-desktop | bash
+#   curl -fsSL https://plugsky.com/install-desktop | bash -s -- --api-key sk-live-...
+#
+set -euo pipefail
+
+PLUGSKY_VERSION="${PLUGSKY_VERSION:-0.1.0}"
+JAN_VERSION="${JAN_VERSION:-0.8.2}"
+PLUGSKY_HOME="${PLUGSKY_HOME:-$HOME/.plugsky-desktop}"
+PLUGSKY_BIN="$PLUGSKY_HOME/bin"
+PLUGSKY_RUNTIME_DIR="$PLUGSKY_HOME/.runtime"
+
+# Colors
+BOLD='\033[1m'
+MUTED='\033[0;2m'
+CYAN='\033[0;36m'
+GREEN='\033[0;32m'
+ORANGE='\033[38;5;214m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+logo() {
+  cat <<'EOF'
+
+  ██████╗ ██╗     ██╗   ██╗ ██████╗ ██╗  ██╗██╗   ██╗
+  ██╔══██╗██║     ██║   ██║██╔════╝ ██║ ██╔╝╚██╗ ██╔╝
+  ██████╔╝██║     ██║   ██║██║  ███╗█████╔╝  ╚████╔╝
+  ██╔═══╝ ██║     ██║   ██║██║   ██║██╔═██╗   ╚██╔╝
+  ██║     ███████╗╚██████╔╝╚██████╔╝██║  ██╗   ██║
+  ╚═╝     ╚══════╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═╝   ╚═╝
+
+            Plugsky Desktop — native AI chat client
+EOF
+}
+
+usage() {
+  cat <<EOF
+Plugsky Desktop installer v$PLUGSKY_VERSION
+
+Usage:
+  curl -fsSL https://plugsky.com/install-desktop | bash
+  curl -fsSL https://plugsky.com/install-desktop | bash -s -- [options]
+
+Options:
+  -h, --help                       Show this help
+  -v, --version <ver>              Install a specific Plugsky Desktop version (default: $PLUGSKY_VERSION)
+      --no-modify-path             Don't modify .zshrc / .bashrc
+      --api-key <key>              Save your Plugsky API key to ~/.plugsky-desktop/.env
+      --uninstall                  Remove Plugsky Desktop
+
+Examples:
+  curl -fsSL https://plugsky.com/install-desktop | bash
+  curl -fsSL https://plugsky.com/install-desktop | bash -s -- --api-key sk-live-abc123
+EOF
+}
+
+detect_os_arch() {
+  raw_os=$(uname -s)
+  case "$raw_os" in
+    Darwin*) os="darwin" ;;
+    Linux*) os="linux" ;;
+    MINGW*|MSYS*|CYGWIN*) os="windows" ;;
+    *) echo -e "${RED}Error: unsupported OS: $raw_os${NC}" >&2; exit 1 ;;
+  esac
+
+  arch=$(uname -m)
+  case "$arch" in
+    aarch64|arm64) arch="arm64" ;;
+    x86_64|x64) arch="x64" ;;
+    *) echo -e "${RED}Error: unsupported architecture: $arch${NC}" >&2; exit 1 ;;
+  esac
+
+  echo "$os $arch"
+}
+
+# Map our OS/arch to Jan release assets
+# macOS: jan-mac-universal-*.zip  (universal binary, works for both arm64 and x64)
+# Linux x64: Jan_*_amd64.AppImage
+# Linux arm64: no official Jan AppImage; warn the user
+# Windows x64: Jan_*_x64-setup.exe
+download_runtime() {
+  local os="$1" arch="$2"
+  local url="" filename=""
+
+  case "$os" in
+    darwin)
+      url="https://github.com/menloresearch/jan/releases/download/v${JAN_VERSION}/jan-mac-universal-${JAN_VERSION}.zip"
+      filename="plugsky-desktop-mac.zip"
+      ;;
+    linux)
+      if [ "$arch" = "x64" ]; then
+        url="https://github.com/menloresearch/jan/releases/download/v${JAN_VERSION}/Jan_${JAN_VERSION}_amd64.AppImage"
+        filename="plugsky-desktop.AppImage"
+      else
+        echo -e "${ORANGE}  ! Jan does not ship an official Linux arm64 build.${NC}"
+        echo -e "${ORANGE}    You can try running the x64 build under Rosetta/QEMU, or use Plugsky OS CLI on arm64 Linux.${NC}"
+        return 1
+      fi
+      ;;
+    windows)
+      url="https://github.com/menloresearch/jan/releases/download/v${JAN_VERSION}/Jan_${JAN_VERSION}_x64-setup.exe"
+      filename="plugsky-desktop-setup.exe"
+      ;;
+  esac
+
+  local tmpdir
+  tmpdir=$(mktemp -d)
+  trap "rm -rf '$tmpdir'" RETURN
+
+  echo -e "${MUTED}Downloading Plugsky Desktop runtime for ${os}/${arch}…${NC}"
+  if ! curl -fsSL --retry 3 -o "$tmpdir/$filename" "$url"; then
+    echo -e "${RED}Error: download failed from $url${NC}" >&2
+    return 1
+  fi
+
+  mkdir -p "$PLUGSKY_RUNTIME_DIR"
+  case "$os" in
+    darwin)
+      cd "$tmpdir" && unzip -q "$filename"
+      # The zip contains Jan.app — rename and move
+      if [ -d "Jan.app" ]; then
+        mv "Jan.app" "$PLUGSKY_RUNTIME_DIR/Plugsky Desktop.app"
+        # Patch the binary name inside (Jan → plugsky-desktop, lowercase, no space)
+        if [ -f "$PLUGSKY_RUNTIME_DIR/Plugsky Desktop.app/Contents/MacOS/Jan" ]; then
+          mv "$PLUGSKY_RUNTIME_DIR/Plugsky Desktop.app/Contents/MacOS/Jan" \
+             "$PLUGSKY_RUNTIME_DIR/Plugsky Desktop.app/Contents/MacOS/plugsky-desktop"
+        fi
+        # Patch Info.plist using PlistBuddy (per-key, avoids the sed bug that
+        # previously broke CFBundleExecutable by replacing it with a spaced name)
+        if [ -f "$PLUGSKY_RUNTIME_DIR/Plugsky Desktop.app/Contents/Info.plist" ]; then
+          local plist="$PLUGSKY_RUNTIME_DIR/Plugsky Desktop.app/Contents/Info.plist"
+          local pb="/usr/libexec/PlistBuddy"
+          if [ -x "$pb" ]; then
+            $pb -c "Set :CFBundleName 'Plugsky Desktop'" "$plist" 2>/dev/null || \
+            $pb -c "Add :CFBundleName string 'Plugsky Desktop'" "$plist" 2>/dev/null || true
+            $pb -c "Set :CFBundleDisplayName 'Plugsky Desktop'" "$plist" 2>/dev/null || \
+            $pb -c "Add :CFBundleDisplayName string 'Plugsky Desktop'" "$plist" 2>/dev/null || true
+            # CFBundleExecutable MUST match the file in Contents/MacOS/ (no space)
+            $pb -c "Set :CFBundleExecutable plugsky-desktop" "$plist" 2>/dev/null || \
+            $pb -c "Add :CFBundleExecutable string plugsky-desktop" "$plist" 2>/dev/null || true
+            $pb -c "Set :CFBundleIdentifier com.plugsky.desktop" "$plist" 2>/dev/null || \
+            $pb -c "Add :CFBundleIdentifier string com.plugsky.desktop" "$plist" 2>/dev/null || true
+          else
+            # Fallback: targeted sed per key (best-effort, no PlistBuddy)
+            sed -i '' \
+              -e 's|<string>Jan</string>|<string>Plugsky Desktop</string>|g' \
+              -e 's|<string>jan</string>|<string>plugsky-desktop</string>|g' \
+              -e 's|jan\.ai\.app|com.plugsky.desktop|g' \
+              "$plist" 2>/dev/null || true
+          fi
+        fi
+        # Re-sign with ad-hoc signature (Jan's original signature is invalid
+        # after the binary + plist edits, so Gatekeeper would block it).
+        if [ -x "/usr/bin/codesign" ]; then
+          /usr/bin/codesign --force --deep --sign - \
+            "$PLUGSKY_RUNTIME_DIR/Plugsky Desktop.app" 2>/dev/null || true
+        fi
+        echo -e "${GREEN}  ✓ Installed to $PLUGSKY_RUNTIME_DIR/Plugsky Desktop.app${NC}"
+      else
+        echo -e "${RED}Error: Jan.app not found in zip${NC}" >&2
+        return 1
+      fi
+      ;;
+    linux)
+      mv "$tmpdir/$filename" "$PLUGSKY_RUNTIME_DIR/$filename"
+      chmod +x "$PLUGSKY_RUNTIME_DIR/$filename"
+      echo -e "${GREEN}  ✓ Installed to $PLUGSKY_RUNTIME_DIR/$filename${NC}"
+      ;;
+    windows)
+      mv "$tmpdir/$filename" "$PLUGSKY_RUNTIME_DIR/$filename"
+      echo -e "${GREEN}  ✓ Installed to $PLUGSKY_RUNTIME_DIR/$filename${NC}"
+      echo -e "${MUTED}  Run $PLUGSKY_RUNTIME_DIR\\$filename to install${NC}"
+      ;;
+  esac
+  return 0
+}
+
+write_shim() {
+  # The shim is the user-facing `plugsky-desktop` command.
+  # It launches the hidden runtime with Plugsky-specific env vars.
+  local runtime_app="$PLUGSKY_RUNTIME_DIR/Plugsky Desktop.app"
+  local runtime_appimage="$PLUGSKY_RUNTIME_DIR/plugsky-desktop.AppImage"
+  local runtime_exe="$PLUGSKY_RUNTIME_DIR/plugsky-desktop-setup.exe"
+
+  mkdir -p "$PLUGSKY_BIN"
+  cat > "$PLUGSKY_BIN/plugsky-desktop" <<SHIM
+#!/usr/bin/env bash
+# Plugsky Desktop shim
+# This is the user-facing entry point. The actual app lives at:
+#   macOS:   $runtime_app
+#   Linux:   $runtime_appimage
+#   Windows: $runtime_exe
+#
+# We set Plugsky env vars (API URL, default model, brand) and launch
+# the runtime. The runtime is unmodified; all branding is config.
+set -e
+
+RUNTIME_APP="$runtime_app"
+RUNTIME_APPIMAGE="$runtime_appimage"
+RUNTIME_EXE="$runtime_exe"
+CONFIG_DIR="\${PLUGSKY_HOME:-\$HOME/.plugsky-desktop}"
+ENV_FILE="\$CONFIG_DIR/.env"
+
+# Load API key from .env if not already in the environment
+if [ -f "\$ENV_FILE" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "\$ENV_FILE"
+  set +a
+fi
+
+# Inject Plugsky defaults. The runtime picks these up at launch.
+export JAN_API_BASE_URL="\${JAN_API_BASE_URL:-https://api.plugsky.com/v1}"
+export JAN_DEFAULT_MODEL="\${JAN_DEFAULT_MODEL:-plugsky-pro}"
+export JAN_DEFAULT_EMBEDDING_MODEL="\${JAN_DEFAULT_EMBEDDING_MODEL:-plugsky-embed}"
+export JAN_BRAND="Plugsky"
+export JAN_PRODUCT_NAME="Plugsky Desktop"
+
+# macOS: launch the .app
+if [ -d "\$RUNTIME_APP" ]; then
+  open -a "\$RUNTIME_APP" "\$@"
+  exit \$?
+fi
+
+# Linux: launch the AppImage
+if [ -x "\$RUNTIME_APPIMAGE" ]; then
+  exec "\$RUNTIME_APPIMAGE" "\$@"
+fi
+
+# Windows: launch the installer / app
+if [ -f "\$RUNTIME_EXE" ]; then
+  exec "\$RUNTIME_EXE" "\$@"
+fi
+
+echo "Plugsky Desktop runtime not found in \$CONFIG_DIR/.runtime/" >&2
+echo "Try reinstalling: curl -fsSL https://plugsky.com/install-desktop | bash" >&2
+exit 1
+SHIM
+  chmod +x "$PLUGSKY_BIN/plugsky-desktop"
+  echo -e "${GREEN}  ✓ Installed shim to $PLUGSKY_BIN/plugsky-desktop${NC}"
+}
+
+write_env() {
+  local api_key="${1:-}"
+  if [ -n "$api_key" ]; then
+    cat > "$PLUGSKY_HOME/.env" <<EOF
+PLUGSKY_API_KEY=$api_key
+EOF
+    chmod 600 "$PLUGSKY_HOME/.env"
+    echo -e "${GREEN}  ✓ Saved API key to $PLUGSKY_HOME/.env (mode 600)${NC}"
+  fi
+}
+
+write_welcome() {
+  cat > "$PLUGSKY_HOME/WELCOME.txt" <<'EOF'
+╔══════════════════════════════════════════════════════════════════╗
+║                    Welcome to Plugsky Desktop                    ║
+║            Native AI chat client — powered by Plugsky            ║
+╚══════════════════════════════════════════════════════════════════╝
+
+  Quick start:
+
+    1. Set your API key (one time):
+         export PLUGSKY_API_KEY=sk-live-...
+
+    2. Launch the app:
+         plugsky-desktop
+
+  Inside the app:
+    - All 31 Plugsky models are pre-configured (plugsky-pro default)
+    - Embeddings via plugsky-embed, plugsky-embed-nim, plugsky-embed-multilingual
+    - Streaming, function calling, vision, JSON mode
+
+  Docs:    https://plugsky.com/docs
+  Status:  https://plugsky.com/status
+  Get key: https://plugsky.com/dashboard
+EOF
+  echo -e "${GREEN}  ✓ Wrote $PLUGSKY_HOME/WELCOME.txt${NC}"
+}
+
+add_to_path() {
+  local rc_file="$1"
+  local line='export PATH="$HOME/.plugsky-desktop/bin:$PATH"'
+  if [ -f "$rc_file" ] && grep -qF '.plugsky-desktop/bin' "$rc_file"; then
+    return 0
+  fi
+  if [ -f "$rc_file" ]; then
+    printf '\n# Plugsky Desktop\n%s\n' "$line" >> "$rc_file"
+  else
+    printf '%s\n' "$line" > "$rc_file"
+  fi
+  echo -e "${GREEN}  ✓ Added ~/.plugsky-desktop/bin to PATH in $rc_file${NC}"
+}
+
+install() {
+  echo
+  logo
+  echo
+  echo -e "${BOLD}Installing Plugsky Desktop v${PLUGSKY_VERSION}${NC}"
+  echo
+
+  read os arch < <(detect_os_arch)
+  echo -e "${MUTED}Detected: $os / $arch${NC}"
+
+  if ! download_runtime "$os" "$arch"; then
+    exit 1
+  fi
+  write_shim
+  write_env "${PLUGSKY_API_KEY:-}"
+  write_welcome
+
+  if [ "${NO_MODIFY_PATH:-false}" = "true" ]; then
+    echo -e "${MUTED}Skipped modifying shell rc (--no-modify-path)${NC}"
+  else
+    case "$os" in
+      darwin|linux)
+        [ -f "$HOME/.zshrc" ] && add_to_path "$HOME/.zshrc"
+        [ -f "$HOME/.bashrc" ] && add_to_path "$HOME/.bashrc"
+        ;;
+      windows) ;;
+    esac
+  fi
+
+  echo
+  echo -e "${BOLD}${GREEN}Plugsky Desktop v${PLUGSKY_VERSION} installed!${NC}"
+  echo
+  echo -e "  ${CYAN}Next steps:${NC}"
+  echo -e "    1. ${BOLD}Restart your terminal${NC} (or: ${MUTED}source ~/.zshrc${NC})"
+  echo -e "    2. Get a key: ${CYAN}https://plugsky.com/dashboard${NC}"
+  echo -e "    3. Set it:    ${MUTED}export PLUGSKY_API_KEY=sk-live-…${NC}"
+  echo -e "    4. Run:       ${MUTED}plugsky-desktop${NC}"
+  echo
+}
+
+uninstall() {
+  echo -e "${ORANGE}Removing $PLUGSKY_HOME …${NC}"
+  rm -rf "$PLUGSKY_HOME"
+  for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
+    if [ -f "$rc" ]; then
+      sed -i.bak '/\.plugsky-desktop\/bin/d' "$rc" 2>/dev/null || true
+    fi
+  done
+  echo -e "${GREEN}  ✓ Removed. Restart your terminal.${NC}"
+}
+
+NO_MODIFY_PATH=false
+PLUGSKY_API_KEY=""
+ACTION="install"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -v|--version) PLUGSKY_VERSION="$2"; shift 2 ;;
+    --no-modify-path) NO_MODIFY_PATH=true; shift ;;
+    --api-key) PLUGSKY_API_KEY="$2"; shift 2 ;;
+    --uninstall) ACTION="uninstall"; shift ;;
+    --) shift ;;  # end of options
+    *) echo -e "${ORANGE}Warning: unknown option '$1'${NC}" >&2; shift ;;
+  esac
+done
+
+case "$ACTION" in
+  install) install ;;
+  uninstall) uninstall ;;
+esac
