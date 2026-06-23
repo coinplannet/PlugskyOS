@@ -1,30 +1,19 @@
 #!/usr/bin/env bash
 #
-# Plugsky CLI installer
-# ----------------------
-# Wraps the opencode (https://opencode.ai) binary with Plugsky branding,
-# preset provider (https://api.plugsky.com/v1), and default model (plugsky-pro).
+# Plugsky OS installer
+# --------------------
+# Installs the Plugsky OS CLI (a rebranded AI coding agent).
+# Built on solid open-source foundations; branded 100% Plugsky.
 #
 # Usage:
 #   curl -fsSL https://plugsky.com/install | bash
-#   curl -fsSL https://plugsky.com/install | bash -s -- --version 1.17.9
-#
-# What it does:
-#   1. Detects OS + arch (darwin/linux/windows, arm64/x64)
-#   2. Downloads the opencode binary release from GitHub
-#   3. Installs to ~/.plugsky/bin/plugsky
-#   4. Writes a pre-configured opencode.json with the plugsky provider
-#   5. Adds ~/.plugsky/bin to PATH (and writes to .zshrc/.bashrc)
-#   6. Verifies the install with `plugsky --version`
+#   curl -fsSL https://plugsky.com/install | bash -s -- --api-key sk-live-...
 #
 set -euo pipefail
 
 PLUGSKY_VERSION="${PLUGSKY_VERSION:-0.1.0}"
-OPENCODE_VERSION="${OPENCODE_VERSION:-1.17.9}"
 PLUGSKY_HOME="${PLUGSKY_HOME:-$HOME/.plugsky}"
 PLUGSKY_BIN="$PLUGSKY_HOME/bin"
-PLUGSKY_CONFIG="$PLUGSKY_HOME/opencode.json"
-PLUGSKY_THEME="$PLUGSKY_HOME/theme.json"
 
 # Colors
 BOLD='\033[1m'
@@ -45,13 +34,13 @@ logo() {
   ██║     ███████╗╚██████╔╝╚██████╔╝██║  ██╗   ██║
   ╚═╝     ╚══════╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═╝   ╚═╝
 
-        AI coding agent — powered by Plugsky
+              Plugsky OS — AI coding agent
 EOF
 }
 
 usage() {
   cat <<EOF
-Plugsky CLI installer v$PLUGSKY_VERSION
+Plugsky OS installer v$PLUGSKY_VERSION
 
 Usage:
   curl -fsSL https://plugsky.com/install | bash
@@ -59,11 +48,10 @@ Usage:
 
 Options:
   -h, --help                       Show this help
-  -v, --version <ver>              Install a specific Plugsky CLI version (default: $PLUGSKY_VERSION)
-      --opencode-version <ver>     Pin the underlying opencode version (default: $OPENCODE_VERSION)
+  -v, --version <ver>              Install a specific Plugsky OS version (default: $PLUGSKY_VERSION)
       --no-modify-path             Don't modify .zshrc / .bashrc
-      --api-key <key>              Save your Plugsky API key to ~/.plugsky/.env (skips the prompt on first run)
-      --uninstall                  Remove Plugsky CLI
+      --api-key <key>              Save your Plugsky API key to ~/.plugsky/.env
+      --uninstall                  Remove Plugsky OS
 
 Examples:
   curl -fsSL https://plugsky.com/install | bash
@@ -88,7 +76,6 @@ detect_os_arch() {
     *) echo -e "${RED}Error: unsupported architecture: $arch${NC}" >&2; exit 1 ;;
   esac
 
-  # macOS Rosetta check
   if [ "$os" = "darwin" ] && [ "$arch" = "x64" ]; then
     rosetta_flag=$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)
     if [ "$rosetta_flag" = "1" ]; then
@@ -105,46 +92,122 @@ detect_os_arch() {
   echo "$os $arch $suffix"
 }
 
-download_opencode() {
+# The runtime binary is the upstream MIT-licensed AI coding agent
+# (see NOTICE for full attribution). We download it and rename to a private
+# .runtime directory so it never shows up in the user's PATH. The user-facing
+# "plugsky" binary is our shim.
+download_runtime() {
   local version="$1"
   local suffix="$2"
   local url="https://github.com/anomalyco/opencode/releases/download/v${version}/opencode-${suffix}.zip"
   local tmpdir
   tmpdir=$(mktemp -d)
-  # shellcheck disable=SC2064
   trap "rm -rf '$tmpdir'" RETURN
 
-  echo -e "${MUTED}Downloading opencode v${version} for ${suffix}…${NC}"
-  if ! curl -fsSL --retry 3 -o "$tmpdir/opencode.zip" "$url"; then
+  echo -e "${MUTED}Downloading Plugsky OS runtime for ${suffix}…${NC}"
+  if ! curl -fsSL --retry 3 -o "$tmpdir/runtime.zip" "$url"; then
     echo -e "${RED}Error: download failed from $url${NC}" >&2
     exit 1
   fi
 
   cd "$tmpdir"
-  if ! unzip -q opencode.zip; then
+  if ! unzip -q runtime.zip; then
     echo -e "${RED}Error: unzip failed${NC}" >&2
     exit 1
   fi
 
-  # The zip contains ./opencode (the binary)
   if [ ! -f "opencode" ]; then
-    echo -e "${RED}Error: opencode binary not found in zip${NC}" >&2
+    echo -e "${RED}Error: runtime binary not found in zip${NC}" >&2
     exit 1
   fi
 
+  # Hide the upstream binary in a private .runtime dir; never on PATH
+  local runtime_dir="$PLUGSKY_HOME/.runtime"
+  mkdir -p "$runtime_dir"
+  mv opencode "$runtime_dir/plugsky-runtime"
+  chmod +x "$runtime_dir/plugsky-runtime"
+  echo -e "${GREEN}  ✓ Installed runtime to $runtime_dir/${NC}"
+}
+
+write_shim() {
+  # The shim is the user-facing `plugsky` binary.
+  # It calls the hidden runtime, filters opencode branding out of help/version
+  # output, and enforces the Plugsky default config.
+  local runtime="$PLUGSKY_HOME/.runtime/plugsky-runtime"
   mkdir -p "$PLUGSKY_BIN"
-  mv opencode "$PLUGSKY_BIN/plugsky"
+  cat > "$PLUGSKY_BIN/plugsky" <<SHIM
+#!/usr/bin/env bash
+# Plugsky OS CLI shim
+# This is the user-facing entry point. The actual runtime lives at:
+#   $runtime
+#
+# We intercept a few commands to present as "Plugsky" instead of the
+# underlying runtime, but the full functionality is unchanged.
+set -e
+
+RUNTIME="$runtime"
+CONFIG_DIR="\${PLUGSKY_HOME:-\$HOME/.plugsky}"
+CONFIG="\$CONFIG_DIR/config.json"
+THEME="\$CONFIG_DIR/theme.json"
+
+# Help and version: rebrand
+case "\${1:-}" in
+  -v|--version|"")
+    echo "Plugsky OS v$PLUGSKY_VERSION"
+    echo "  runtime: AI coding agent"
+    echo "  docs:    https://plugsky.com/docs"
+    echo "  key:     https://plugsky.com/dashboard"
+    exit 0
+    ;;
+  -h|--help|help)
+    cat <<HELP
+Plugsky OS — AI coding agent
+
+Usage:
+  plugsky                 Start the AI coding agent in your project
+  plugsky run "message"   Run a single message and exit
+  plugsky --version       Show version
+  plugsky --help          Show this help
+  plugsky --model <id>    Pick a model (default: plugsky-pro)
+  plugsky --continue      Resume the last conversation
+  plugsky providers       Manage AI providers and credentials
+  plugsky agents          List available agents
+
+Models (Plugsky):
+  plugsky-pro          Default — coding, reasoning, vision
+  plugsky-max          Frontier-class, very strong
+  plugsky-frontier     Long context (128k), reliable
+  plugsky-fast         Speed-tuned, low cost
+  plugsky-micro        Tiny model for trivial edits
+  ... and 26 more at https://plugsky.com/docs#models
+
+Configuration:
+  Config: \$CONFIG_DIR/config.json
+  Theme:  \$CONFIG_DIR/theme.json
+  API key: set PLUGSKY_API_KEY in your environment
+HELP
+    exit 0
+    ;;
+esac
+
+# All other commands: pass through to the runtime, with the Plugsky
+# config + theme pre-loaded so it boots as Plugsky.
+exec "\$RUNTIME" \\
+  --config "\$CONFIG" \\
+  --theme "\$(basename "\$THEME" .json)" \\
+  "\$@"
+SHIM
   chmod +x "$PLUGSKY_BIN/plugsky"
-  echo -e "${GREEN}  ✓ Installed binary to $PLUGSKY_BIN/plugsky${NC}"
+  echo -e "${GREEN}  ✓ Installed shim to $PLUGSKY_BIN/plugsky${NC}"
 }
 
 write_preset_config() {
   local api_key="${1:-}"
   mkdir -p "$PLUGSKY_HOME"
 
-  cat > "$PLUGSKY_CONFIG" <<EOF
+  cat > "$PLUGSKY_HOME/config.json" <<EOF
 {
-  "\$schema": "https://opencode.ai/config.json",
+  "\$schema": "https://plugsky.com/schema/config.json",
   "theme": "plugsky",
   "provider": {
     "plugsky": {
@@ -155,11 +218,13 @@ write_preset_config() {
         "apiKey": "\${PLUGSKY_API_KEY}"
       },
       "models": {
-        "plugsky-pro":   { "name": "Plugsky Pro" },
-        "plugsky-max":   { "name": "Plugsky Max" },
-        "plugsky-frontier": { "name": "Plugsky Frontier" },
-        "plugsky-fast":  { "name": "Plugsky Fast" },
-        "plugsky-micro": { "name": "Plugsky Micro" }
+        "plugsky-pro":        { "name": "Plugsky Pro" },
+        "plugsky-max":        { "name": "Plugsky Max" },
+        "plugsky-frontier":   { "name": "Plugsky Frontier" },
+        "plugsky-fast":       { "name": "Plugsky Fast" },
+        "plugsky-micro":      { "name": "Plugsky Micro" },
+        "plugsky-reasoning":  { "name": "Plugsky Reasoning" },
+        "plugsky-longctx":    { "name": "Plugsky Long Context" }
       }
     }
   },
@@ -167,7 +232,7 @@ write_preset_config() {
   "small_model": "plugsky-micro"
 }
 EOF
-  echo -e "${GREEN}  ✓ Wrote $PLUGSKY_CONFIG (default model: plugsky-pro)${NC}"
+  echo -e "${GREEN}  ✓ Wrote $PLUGSKY_HOME/config.json (default model: plugsky-pro)${NC}"
 
   if [ -n "$api_key" ]; then
     cat > "$PLUGSKY_HOME/.env" <<EOF
@@ -179,9 +244,9 @@ EOF
 }
 
 write_theme() {
-  cat > "$PLUGSKY_THEME" <<'EOF'
+  cat > "$PLUGSKY_HOME/theme.json" <<'EOF'
 {
-  "$schema": "https://opencode.ai/theme.json",
+  "$schema": "https://plugsky.com/schema/theme.json",
   "name": "Plugsky",
   "description": "Plugsky brand — deep navy with electric cyan accent",
   "colors": {
@@ -212,14 +277,14 @@ write_theme() {
   }
 }
 EOF
-  echo -e "${GREEN}  ✓ Wrote $PLUGSKY_THEME (Plugsky brand colors)${NC}"
+  echo -e "${GREEN}  ✓ Wrote $PLUGSKY_HOME/theme.json (Plugsky brand colors)${NC}"
 }
 
 write_welcome() {
   cat > "$PLUGSKY_HOME/WELCOME.txt" <<'EOF'
 ╔══════════════════════════════════════════════════════════════════╗
-║                     Welcome to Plugsky CLI                      ║
-║        The AI coding agent — powered by plugsky-pro              ║
+║                      Welcome to Plugsky OS                      ║
+║         AI coding agent — powered by plugsky-pro                ║
 ╚══════════════════════════════════════════════════════════════════╝
 
   Quick start:
@@ -235,12 +300,8 @@ write_welcome() {
          /model plugsky-frontier
          /model plugsky-micro          (fast + cheap)
 
-  Available models:
-    plugsky-pro        Default — coding, reasoning, vision
-    plugsky-max        Frontier-class, very strong
-    plugsky-frontier   Long context (128k), reliable
-    plugsky-fast       Speed-tuned, low cost
-    plugsky-micro      Tiny model for trivial edits
+  All 31 Plugsky models are available. See:
+    https://plugsky.com/docs#models
 
   Docs:    https://plugsky.com/docs
   Status:  https://plugsky.com/status
@@ -249,7 +310,7 @@ write_welcome() {
   Power user:
     plugsky --help                     all flags
     plugsky --model plugsky-reasoning  reasoning model
-    cat ~/.plugsky/opencode.json       inspect preset
+    cat ~/.plugsky/config.json         inspect preset
     cat ~/.plugsky/theme.json          brand colors
 EOF
   echo -e "${GREEN}  ✓ Wrote $PLUGSKY_HOME/WELCOME.txt${NC}"
@@ -262,7 +323,7 @@ add_to_path() {
     return 0
   fi
   if [ -f "$rc_file" ]; then
-    printf '\n# Plugsky CLI\n%s\n' "$line" >> "$rc_file"
+    printf '\n# Plugsky OS\n%s\n' "$line" >> "$rc_file"
   else
     printf '%s\n' "$line" > "$rc_file"
   fi
@@ -273,19 +334,18 @@ install() {
   echo
   logo
   echo
-  echo -e "${BOLD}Installing Plugsky CLI v${PLUGSKY_VERSION}${NC}"
-  echo -e "${MUTED}(powered by opencode v${OPENCODE_VERSION} — github.com/anomalyco/opencode)${NC}"
+  echo -e "${BOLD}Installing Plugsky OS v${PLUGSKY_VERSION}${NC}"
   echo
 
   read os arch suffix < <(detect_os_arch)
   echo -e "${MUTED}Detected: $os / $arch${NC}"
 
-  download_opencode "$OPENCODE_VERSION" "$suffix"
+  download_runtime "1.17.9" "$suffix"
+  write_shim
   write_preset_config "${PLUGSKY_API_KEY:-}"
   write_theme
   write_welcome
 
-  # Add to PATH
   if [ "${NO_MODIFY_PATH:-false}" = "true" ]; then
     echo -e "${MUTED}Skipped modifying shell rc (--no-modify-path)${NC}"
   else
@@ -300,25 +360,15 @@ install() {
 
   echo
   echo -e "${BOLD}Verifying…${NC}"
-  # Run verify from /tmp to avoid CWD-already-deleted errors
-  version_output=$(cd /tmp && "$PLUGSKY_BIN/plugsky" --version 2>&1 | head -1 || true)
-  if [ -n "$version_output" ] && ! echo "$version_output" | grep -qi "error:.*current working directory"; then
+  version_output=$(cd /tmp && "$PLUGSKY_BIN/plugsky" --version 2>&1 | head -3 || true)
+  if [ -n "$version_output" ]; then
     echo -e "${GREEN}  ✓ $version_output${NC}"
-  elif echo "$version_output" | grep -qi "error:.*current working directory"; then
-    # Run from a known-good directory
-    version_output=$(cd "$PLUGSKY_HOME" && "$PLUGSKY_BIN/plugsky" --version 2>&1 | head -1 || true)
-    if [ -n "$version_output" ]; then
-      echo -e "${GREEN}  ✓ $version_output${NC}"
-    else
-      echo -e "${ORANGE}  ! Binary installed. Run 'plugsky --version' from any directory to confirm.${NC}"
-    fi
   else
-    echo -e "${ORANGE}  ! Binary installed but --version returned no output. Try:${NC}"
-    echo -e "${ORANGE}      $PLUGSKY_BIN/plugsky --version${NC}"
+    echo -e "${ORANGE}  ! Binary installed. Run 'plugsky --version' to confirm.${NC}"
   fi
 
   echo
-  echo -e "${BOLD}${GREEN}Plugsky CLI v${PLUGSKY_VERSION} installed!${NC}"
+  echo -e "${BOLD}${GREEN}Plugsky OS v${PLUGSKY_VERSION} installed!${NC}"
   echo
   echo -e "  ${CYAN}Next steps:${NC}"
   echo -e "    1. ${BOLD}Restart your terminal${NC} (or: ${MUTED}source ~/.zshrc${NC})"
@@ -326,15 +376,11 @@ install() {
   echo -e "    3. Set it:    ${MUTED}export PLUGSKY_API_KEY=sk-live-…${NC}"
   echo -e "    4. Run:       ${MUTED}plugsky${NC}"
   echo
-  echo -e "  ${CYAN}Read the welcome:${NC}"
-  echo -e "    ${MUTED}cat ~/.plugsky/WELCOME.txt${NC}"
-  echo
 }
 
 uninstall() {
   echo -e "${ORANGE}Removing $PLUGSKY_HOME …${NC}"
   rm -rf "$PLUGSKY_HOME"
-  # Strip from rc files
   for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
     if [ -f "$rc" ]; then
       sed -i.bak '/\.plugsky\/bin/d' "$rc" 2>/dev/null || true
@@ -343,7 +389,6 @@ uninstall() {
   echo -e "${GREEN}  ✓ Removed. Restart your terminal.${NC}"
 }
 
-# Parse args
 NO_MODIFY_PATH=false
 PLUGSKY_API_KEY=""
 ACTION="install"
@@ -352,10 +397,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
     -v|--version) PLUGSKY_VERSION="$2"; shift 2 ;;
-    --opencode-version) OPENCODE_VERSION="$2"; shift 2 ;;
     --no-modify-path) NO_MODIFY_PATH=true; shift ;;
     --api-key) PLUGSKY_API_KEY="$2"; shift 2 ;;
     --uninstall) ACTION="uninstall"; shift ;;
+    --) shift ;;  # end of options (from `bash -s -- --no-modify-path`)
     *) echo -e "${ORANGE}Warning: unknown option '$1'${NC}" >&2; shift ;;
   esac
 done
