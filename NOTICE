@@ -1,24 +1,25 @@
 Plugsky OS
 Copyright (c) 2026 Plugsky
 
-This product includes software developed by third parties:
+This product includes software developed by third parties. The Plugsky OS
+installers download, embed, and/or wrap unmodified builds of the following
+open-source projects:
 
 ================================================================================
 opencode (https://github.com/anomalyco/opencode)
 Copyright (c) SST / anomalyco
 License: MIT
-================================================================================
 
+Used by: Plugsky CLI (cli/install)
 The Plugsky OS CLI installer downloads and embeds the opencode binary
 (an AI coding agent) as a private runtime at `~/.plugsky/.runtime/`. The
 upstream binary is unmodified; the user-facing "plugsky" command is a thin
 shim that rebrands --version and --help output and pre-loads the Plugsky
 provider configuration.
 
-The full MIT license for opencode is reproduced below:
+The full MIT license for opencode is reproduced below.
 
 --------------------------------------------------------------------------------
-
 MIT License
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -36,5 +37,36 @@ IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
 AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
+Jan (https://github.com/menloresearch/jan)
+Copyright (c) Menlo Research Inc.
+License: Apache-2.0
+
+Used by: Plugsky Desktop (desktop/install)
+The Plugsky Desktop installer downloads and embeds the Jan binary (a native
+AI chat client) as a private runtime at `~/.plugsky-desktop/.runtime/`. We
+patch the macOS Info.plist to set CFBundleName, CFBundleDisplayName,
+CFBundleExecutable, and CFBundleIdentifier to Plugsky branding strings, and
+re-sign the bundle ad-hoc. The Jan application code itself is unmodified.
+
+The full Apache-2.0 license for Jan is available at:
+https://github.com/menloresearch/jan/blob/main/LICENSE
+
+================================================================================
+Open WebUI (https://github.com/open-webui/open-webui)
+Copyright (c) 2023- Open WebUI Inc.
+License: Open WebUI License (custom, see link below)
+
+Used by: Plugsky Web (desktop/openwebui/install)
+The Plugsky Web installer pulls the official Open WebUI Docker image (Docker
+backend) or runs the official open-webui pip package (pip backend), unmodified.
+Plugsky branding lives in the shim command name (plugsky-web), the default
+model and API URL config in ~/.plugsky-web/.env, and accompanying
+documentation. The Open WebUI application code, name, and visual identifiers
+remain unmodified per the Open WebUI License's branding clause.
+
+The full Open WebUI License is available at:
+https://github.com/open-webui/open-webui/blob/main/LICENSE

@@ -1,0 +1,771 @@
+#!/usr/bin/env bash
+#
+# Plugsky Web installer
+# ---------------------
+# Installs Plugsky Web — a self-hosted AI chat UI powered by Open WebUI
+# and configured end-to-end for Plugsky.
+#
+# This installer does NOT modify Open WebUI. It downloads/runs the official
+# Open WebUI build (Docker image or pip package, unmodified) and configures
+# it via env vars to talk to Plugsky as the OpenAI-compatible backend.
+#
+# Usage:
+#   curl -fsSL https://plugsky.com/install-web | bash
+#   curl -fsSL https://plugsky.com/install-web | bash -s -- --api-key sk-live-...
+#
+set -euo pipefail
+
+PLUGSKY_VERSION="${PLUGSKY_VERSION:-0.1.0}"
+OPENWEBUI_VERSION="${OPENWEBUI_VERSION:-main}"
+PLUGSKY_HOME="${PLUGSKY_HOME:-$HOME/.plugsky-web}"
+PLUGSKY_BIN="$PLUGSKY_HOME/bin"
+PLUGSKY_DATA_DIR="$PLUGSKY_HOME/data"
+PLUGSKY_LOG_DIR="$PLUGSKY_HOME/logs"
+PLUGSKY_PID_FILE="$PLUGSKY_HOME/plugsky-web.pid"
+PLUGSKY_PORT="${PLUGSKY_PORT:-8080}"
+BACKEND_CHOICE_FILE="$PLUGSKY_HOME/backend"
+API_BASE_URL="${API_BASE_URL:-https://api.plugsky.com/v1}"
+DEFAULT_MODEL="${DEFAULT_MODEL:-plugsky-pro}"
+EMBED_MODEL="${EMBED_MODEL:-plugsky-embed}"
+
+# Colors
+BOLD='\033[1m'
+MUTED='\033[0;2m'
+CYAN='\033[0;36m'
+GREEN='\033[0;32m'
+ORANGE='\033[38;5;214m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+logo() {
+  cat <<'EOF'
+
+  ██████╗ ██╗     ██╗   ██╗ ██████╗ ██╗  ██╗██╗   ██╗
+  ██╔══██╗██║     ██║   ██║██╔════╝ ██║ ██╔╝╚██╗ ██╔╝
+  ██████╔╝██║     ██║   ██║██║  ███╗█████╔╝  ╚████╔╝
+  ██╔═══╝ ██║     ██║   ██║██║   ██║██╔═██╗   ╚██╔╝
+  ██║     ███████╗╚██████╔╝╚██████╔╝██║  ██╗   ██║
+  ╚═╝     ╚══════╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═╝   ╚═╝
+
+            Plugsky Web — self-hosted AI chat UI
+EOF
+}
+
+usage() {
+  cat <<EOF
+Plugsky Web installer v$PLUGSKY_VERSION
+
+Usage:
+  curl -fsSL https://plugsky.com/install-web | bash
+  curl -fsSL https://plugsky.com/install-web | bash -s -- [options]
+
+Options:
+  -h, --help                       Show this help
+  -v, --version <ver>              Install a specific Plugsky Web version (default: $PLUGSKY_VERSION)
+      --no-modify-path             Don't modify .zshrc / .bashrc
+      --api-key <key>              Save your Plugsky API key to ~/.plugsky-web/.env
+      --backend <docker|pip>       Force a specific backend (default: auto-detect)
+      --port <port>                Port for the Web UI (default: $PLUGSKY_PORT)
+      --python <path>             Use a specific Python binary (pip backend)
+      --uninstall                  Remove Plugsky Web
+
+Examples:
+  curl -fsSL https://plugsky.com/install-web | bash
+  curl -fsSL https://plugsky.com/install-web | bash -s -- --api-key sk-live-abc123
+  curl -fsSL https://plugsky.com/install-web | bash -s -- --backend pip
+
+Backends:
+  docker   Official ghcr.io/open-webui/open-webui:$OPENWEBUI_VERSION image
+           Requires: Docker Desktop / dockerd. Cleanest, most isolated.
+  pip      pip install open-webui into a dedicated venv
+           Requires: Python 3.11+. No Docker. Slower first start.
+
+After install, manage the server with:
+  plugsky-web start                Start the server (background) and open browser
+  plugsky-web stop                 Stop the server
+  plugsky-web restart              Stop + start
+  plugsky-web status               Is it running? On which port?
+  plugsky-web logs [N]             Tail the last N lines of logs (default: 50)
+  plugsky-web open                 Open http://localhost:$PLUGSKY_PORT in your browser
+  plugsky-web update               Pull the latest image (Docker) or upgrade the package (pip)
+  plugsky-web uninstall            Remove everything
+EOF
+}
+
+detect_os() {
+  raw_os=$(uname -s)
+  case "$raw_os" in
+    Darwin*) os="darwin" ;;
+    Linux*) os="linux" ;;
+    MINGW*|MSYS*|CYGWIN*) os="windows" ;;
+    *) echo -e "${RED}Error: unsupported OS: $raw_os${NC}" >&2; exit 1 ;;
+  esac
+  echo "$os"
+}
+
+detect_backend() {
+  if [ "${FORCE_BACKEND:-}" = "docker" ] || [ "${FORCE_BACKEND:-}" = "pip" ]; then
+    echo "$FORCE_BACKEND"
+    return
+  fi
+  # Prefer Docker: cleaner isolation, no Python deps needed
+  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    echo "docker"
+    return
+  fi
+  # Fall back to pip if a compatible Python is available
+  local py
+  py=$(detect_compatible_python)
+  if [ -n "$py" ]; then
+    echo "pip"
+    return
+  fi
+  echo "none"
+}
+
+# Returns the path to a Python 3.11 or 3.12 binary, or empty.
+# open-webui currently supports 3.11 / 3.12 only (3.13+ is rejected by pip).
+# Strategy:
+#   1. Honor --python override if set
+#   2. Look for explicit python3.11 / python3.12 on PATH
+#   3. On macOS, try /usr/bin/python3 (system, not venv-leaked)
+#   4. Fall back to whatever `python3` resolves to
+# In every case, verify 3.11 ≤ version < 3.13.
+detect_compatible_python() {
+  if [ -n "${FORCE_PYTHON:-}" ] && [ -x "${FORCE_PYTHON}" ]; then
+    if python_is_compatible "${FORCE_PYTHON}"; then
+      echo "${FORCE_PYTHON}"
+      return
+    else
+      return
+    fi
+  fi
+  for cand in python3.12 python3.11; do
+    if command -v "$cand" >/dev/null 2>&1; then
+      local p
+      p=$(command -v "$cand")
+      if python_is_compatible "$p"; then
+        echo "$p"
+        return
+      fi
+    fi
+  done
+  if [ "$(uname -s)" = "Darwin" ] && [ -x "/usr/bin/python3" ]; then
+    if python_is_compatible "/usr/bin/python3"; then
+      echo "/usr/bin/python3"
+      return
+    fi
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    local p
+    p=$(command -v python3)
+    if python_is_compatible "$p"; then
+      echo "$p"
+      return
+    fi
+  fi
+  echo ""
+}
+
+python_is_compatible() {
+  local py="$1"
+  local ver
+  ver=$("$py" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo "0.0")
+  local maj="${ver%%.*}"
+  local min="${ver##*.}"
+  [ "$maj" = "3" ] && [ "$min" -ge 11 ] && [ "$min" -le 12 ]
+}
+
+check_docker() {
+  if ! command -v docker >/dev/null 2>&1; then
+    echo -e "${ORANGE}  ! Docker not found. Install Docker Desktop:${NC}" >&2
+    echo -e "${ORANGE}    macOS:   https://www.docker.com/products/docker-desktop${NC}" >&2
+    echo -e "${ORANGE}    Linux:   curl -fsSL https://get.docker.com | sh${NC}" >&2
+    echo -e "${ORANGE}    Windows: https://www.docker.com/products/docker-desktop${NC}" >&2
+    return 1
+  fi
+  if ! docker info >/dev/null 2>&1; then
+    echo -e "${ORANGE}  ! Docker is installed but the daemon is not running.${NC}" >&2
+    echo -e "${ORANGE}    Start Docker Desktop, then re-run this installer.${NC}" >&2
+    return 1
+  fi
+  return 0
+}
+
+write_docker_pull() {
+  # Pre-pull the image so the first 'plugsky-web start' is fast.
+  echo -e "${MUTED}Pulling ghcr.io/open-webui/open-webui:$OPENWEBUI_VERSION (~1.5 GB)…${NC}"
+  if ! docker pull "ghcr.io/open-webui/open-webui:$OPENWEBUI_VERSION"; then
+    echo -e "${RED}  ✗ Image pull failed${NC}" >&2
+    return 1
+  fi
+  echo -e "${GREEN}  ✓ Image pulled${NC}"
+}
+
+write_pip_install() {
+  # Create a dedicated venv with a compatible Python and install open-webui.
+  local py
+  py=$(detect_compatible_python)
+  if [ -z "$py" ]; then
+    echo -e "${RED}  ✗ No compatible Python found (open-webui needs 3.11 or 3.12).${NC}" >&2
+    echo -e "${ORANGE}    Install one of:${NC}" >&2
+    echo -e "${ORANGE}      macOS:  brew install python@3.12${NC}" >&2
+    echo -e "${ORANGE}      Linux:  sudo apt install python3.12${NC}" >&2
+    echo -e "${ORANGE}      Any:    pyenv install 3.12 && pyenv global 3.12${NC}" >&2
+    echo -e "${ORANGE}    Or pass --python /path/to/python3.12 to use a specific binary.${NC}" >&2
+    return 1
+  fi
+  echo -e "${MUTED}Using Python: $py ($($py -V 2>&1))${NC}"
+  echo -e "${MUTED}Creating venv at $PLUGSKY_HOME/venv…${NC}"
+  if ! "$py" -m venv "$PLUGSKY_HOME/venv"; then
+    echo -e "${RED}  ✗ venv creation failed${NC}" >&2
+    return 1
+  fi
+  echo -e "${GREEN}  ✓ venv created${NC}"
+
+  echo -e "${MUTED}Installing open-webui into venv (~2 min, ~500 MB of deps)…${NC}"
+  if ! "$PLUGSKY_HOME/venv/bin/pip" install --quiet --upgrade pip; then
+    echo -e "${RED}  ✗ pip upgrade failed${NC}" >&2
+    return 1
+  fi
+  if ! "$PLUGSKY_HOME/venv/bin/pip" install --quiet open-webui; then
+    echo -e "${RED}  ✗ open-webui install failed${NC}" >&2
+    echo -e "${ORANGE}    Check that the venv Python is 3.11 or 3.12.${NC}" >&2
+    return 1
+  fi
+  echo -e "${GREEN}  ✓ open-webui installed${NC}"
+}
+
+write_env() {
+  local api_key="${1:-}"
+  cat > "$PLUGSKY_HOME/.env" <<EOF
+# Plugsky Web configuration
+# Generated by plugsky-web installer v$PLUGSKY_VERSION
+
+PLUGSKY_API_KEY=$api_key
+PLUGSKY_PORT=$PLUGSKY_PORT
+API_BASE_URL=$API_BASE_URL
+DEFAULT_MODEL=$DEFAULT_MODEL
+EMBED_MODEL=$EMBED_MODEL
+EOF
+  chmod 600 "$PLUGSKY_HOME/.env"
+  echo -e "${GREEN}  ✓ Wrote $PLUGSKY_HOME/.env (mode 600)${NC}"
+}
+
+write_shim() {
+  # The shim is the user-facing `plugsky-web` command.
+  # Subcommands: start, stop, restart, status, logs, open, update, uninstall
+  mkdir -p "$PLUGSKY_BIN" "$PLUGSKY_DATA_DIR" "$PLUGSKY_LOG_DIR"
+  cat > "$PLUGSKY_BIN/plugsky-web" <<SHIM
+#!/usr/bin/env bash
+# Plugsky Web shim
+# Manages a self-hosted Open WebUI instance configured for Plugsky.
+set -e
+
+CONFIG_DIR="\${PLUGSKY_HOME:-\$HOME/.plugsky-web}"
+ENV_FILE="\$CONFIG_DIR/.env"
+BACKEND_FILE="\$CONFIG_DIR/backend"
+PID_FILE="\$CONFIG_DIR/plugsky-web.pid"
+LOG_DIR="\$CONFIG_DIR/logs"
+DATA_DIR="\$CONFIG_DIR/data"
+PORT="\${PLUGSKY_PORT:-8080}"
+
+BOLD='\033[1m'
+MUTED='\033[0;2m'
+CYAN='\033[0;36m'
+GREEN='\033[0;32m'
+ORANGE='\033[38;5;214m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+log()  { echo -e "\${MUTED}[\$(date '+%H:%M:%S')]\${NC} \$*"; }
+ok()   { echo -e "\${GREEN}  ✓\$NC \$*"; }
+warn() { echo -e "\${ORANGE}  !\$NC \$*"; }
+err()  { echo -e "\${RED}  ✗\$NC \$*" >&2; }
+
+# Load env
+if [ -f "\$ENV_FILE" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "\$ENV_FILE"
+  set +a
+fi
+: "\${PLUGSKY_API_KEY:=\${OPENAI_API_KEY:-}}"
+: "\${API_BASE_URL:=https://api.plugsky.com/v1}"
+: "\${DEFAULT_MODEL:=plugsky-pro}"
+
+BACKEND="\${1:-}"
+shift || true
+
+backend_kind() {
+  if [ -f "\$BACKEND_FILE" ]; then
+    cat "\$BACKEND_FILE"
+  else
+    echo "unknown"
+  fi
+}
+
+is_running() {
+  if [ -f "\$PID_FILE" ]; then
+    local pid
+    pid="\$(cat "\$PID_FILE" 2>/dev/null || true)"
+    if [ -n "\$pid" ] && kill -0 "\$pid" 2>/dev/null; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+# Wait for Open WebUI to be ready (up to 60s).
+wait_ready() {
+  local i=0 url="http://localhost:\$PORT"
+  while [ \$i -lt 60 ]; do
+    if curl -fsS --max-time 2 "\$url" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+    i=\$((i+1))
+  done
+  return 1
+}
+
+cmd_start() {
+  if is_running; then
+    warn "Already running (PID \$(cat "\$PID_FILE")). Run 'plugsky-web restart' to reload."
+    return 0
+  fi
+  if [ -z "\$PLUGSKY_API_KEY" ]; then
+    err "PLUGSKY_API_KEY is not set. Re-run installer with --api-key, or:"
+    err "  export PLUGSKY_API_KEY=sk-live-..."
+    err "  plugsky-web start"
+    return 1
+  fi
+
+  local kind="\$(backend_kind)"
+  case "\$kind" in
+    docker)
+      log "Starting via Docker (image: ghcr.io/open-webui/open-webui:main)…"
+      docker run -d \\
+        --name plugsky-web \\
+        --restart unless-stopped \\
+        -p "\$PORT:8080" \\
+        -v open-webui-data:/app/backend/data \\
+        -e "OPENAI_API_BASE_URL=\$API_BASE_URL" \\
+        -e "OPENAI_API_KEY=\$PLUGSKY_API_KEY" \\
+        -e "ENABLE_OPENAI_API=True" \\
+        -e "DEFAULT_MODELS=\$DEFAULT_MODEL" \\
+        -e "WEBUI_SECRET_KEY=\${WEBUI_SECRET_KEY:-plugsky-web-\$(date +%s)}" \\
+        -e "PORT=8080" \\
+        "ghcr.io/open-webui/open-webui:main" \\
+        > "\$LOG_DIR/docker-stdout.log" 2> "\$LOG_DIR/docker-stderr.log"
+      # Docker manages the container; for the PID file, use the container ID
+      docker inspect --format '{{.Id}}' plugsky-web > "\$PID_FILE" 2>/dev/null || true
+      log "Container started. Waiting for http://localhost:\$PORT …"
+      if wait_ready; then
+        ok "Server ready at http://localhost:\$PORT"
+      else
+        warn "Server didn't respond in 60s. Check logs:"
+        warn "  plugsky-web logs"
+      fi
+      ;;
+
+    pip)
+      log "Starting via pip (open-webui serve)…"
+      if [ ! -x "\$CONFIG_DIR/venv/bin/open-webui" ]; then
+        err "open-webui not installed. Re-run the installer."
+        return 1
+      fi
+      nohup env \\
+        OPENAI_API_BASE_URL="\$API_BASE_URL" \\
+        OPENAI_API_KEY="\$PLUGSKY_API_KEY" \\
+        ENABLE_OPENAI_API=True \\
+        DEFAULT_MODELS="\$DEFAULT_MODEL" \\
+        WEBUI_SECRET_KEY="\${WEBUI_SECRET_KEY:-plugsky-web-\$(date +%s)}" \\
+        PORT="\$PORT" \\
+        DATA_DIR="\$DATA_DIR" \\
+        "\$CONFIG_DIR/venv/bin/open-webui" serve \\
+        > "\$LOG_DIR/open-webui.log" 2>&1 &
+      echo \$! > "\$PID_FILE"
+      log "Spawned PID \$(cat "\$PID_FILE"). Waiting for http://localhost:\$PORT …"
+      if wait_ready; then
+        ok "Server ready at http://localhost:\$PORT"
+      else
+        warn "Server didn't respond in 60s. Check logs:"
+        warn "  plugsky-web logs"
+      fi
+      ;;
+
+    *)
+      err "No backend configured. Re-run the installer to set one up."
+      return 1
+      ;;
+  esac
+
+  if command -v open >/dev/null 2>&1; then
+    sleep 1
+    open "http://localhost:\$PORT" 2>/dev/null || true
+  fi
+  ok "Open WebUI: http://localhost:\$PORT (powered by \$API_BASE_URL)"
+}
+
+cmd_stop() {
+  local kind="\$(backend_kind)"
+  case "\$kind" in
+    docker)
+      if docker ps -a --format '{{.Names}}' | grep -qx 'plugsky-web'; then
+        log "Stopping container plugsky-web…"
+        docker stop plugsky-web >/dev/null 2>&1 || true
+        ok "Stopped."
+      else
+        warn "No plugsky-web container running."
+      fi
+      rm -f "\$PID_FILE"
+      ;;
+    pip)
+      if is_running; then
+        local pid
+        pid="\$(cat "\$PID_FILE")"
+        log "Stopping PID \$pid…"
+        kill "\$pid" 2>/dev/null || true
+        sleep 2
+        if kill -0 "\$pid" 2>/dev/null; then
+          warn "Process still alive, sending SIGKILL…"
+          kill -9 "\$pid" 2>/dev/null || true
+        fi
+        ok "Stopped."
+      else
+        warn "No plugsky-web process running."
+      fi
+      rm -f "\$PID_FILE"
+      ;;
+    *)
+      err "No backend configured."
+      return 1
+      ;;
+  esac
+}
+
+cmd_restart() {
+  cmd_stop || true
+  sleep 1
+  cmd_start
+}
+
+cmd_status() {
+  local kind="\$(backend_kind)"
+  echo -e "\${BOLD}Plugsky Web status\${NC}"
+  echo -e "  \${MUTED}backend:\${NC}  \$kind"
+  echo -e "  \${MUTED}home:\${NC}     \$CONFIG_DIR"
+  echo -e "  \${MUTED}port:\${NC}     \$PORT"
+  echo -e "  \${MUTED}api:\${NC}      \$API_BASE_URL"
+  echo -e "  \${MUTED}model:\${NC}    \$DEFAULT_MODEL"
+  echo
+  case "\$kind" in
+    docker)
+      if docker ps -a --format '{{.Names}}' | grep -qx 'plugsky-web'; then
+        docker ps --filter "name=plugsky-web" --format "  \${GREEN}●\${NC} container {{.Names}} ({{.Status}}) — http://localhost:\$PORT"
+      else
+        echo -e "  \${MUTED}○\${NC} container not running. Start with: \${CYAN}plugsky-web start\${NC}"
+      fi
+      ;;
+    pip)
+      if is_running; then
+        echo -e "  \${GREEN}●\${NC} process \$(cat "\$PID_FILE") running — http://localhost:\$PORT"
+      else
+        echo -e "  \${MUTED}○\${NC} not running. Start with: \${CYAN}plugsky-web start\${NC}"
+      fi
+      ;;
+    *)
+      echo -e "  \${ORANGE}!\${NC} no backend configured"
+      ;;
+  esac
+}
+
+cmd_logs() {
+  local lines="\${1:-50}"
+  local kind="\$(backend_kind)"
+  case "\$kind" in
+    docker)
+      if docker ps -a --format '{{.Names}}' | grep -qx 'plugsky-web'; then
+        docker logs --tail "\$lines" plugsky-web
+      else
+        warn "No plugsky-web container. Showing cached logs:"
+        tail -n "\$lines" "\$LOG_DIR/"docker-*.log 2>/dev/null || warn "(no logs yet)"
+      fi
+      ;;
+    pip)
+      if [ -f "\$LOG_DIR/open-webui.log" ]; then
+        tail -n "\$lines" "\$LOG_DIR/open-webui.log"
+      else
+        warn "(no logs yet)"
+      fi
+      ;;
+    *)
+      err "No backend configured."
+      return 1
+      ;;
+  esac
+}
+
+cmd_open() {
+  if command -v open >/dev/null 2>&1; then
+    open "http://localhost:\$PORT"
+  elif command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "http://localhost:\$PORT"
+  else
+    err "No 'open' or 'xdg-open' command. Open http://localhost:\$PORT manually."
+  fi
+}
+
+cmd_update() {
+  local kind="\$(backend_kind)"
+  case "\$kind" in
+    docker)
+      log "Pulling ghcr.io/open-webui/open-webui:main…"
+      docker pull ghcr.io/open-webui/open-webui:main
+      ok "Image updated. Restart with: plugsky-web restart"
+      ;;
+    pip)
+      if [ ! -x "\$CONFIG_DIR/venv/bin/pip" ]; then
+        err "open-webui not installed. Re-run the installer to set up the venv."
+        return 1
+      fi
+      log "Upgrading open-webui…"
+      "\$CONFIG_DIR/venv/bin/pip" install --quiet --upgrade open-webui
+      ok "Package updated. Restart with: plugsky-web restart"
+      ;;
+    *)
+      err "No backend configured."
+      return 1
+      ;;
+  esac
+}
+
+cmd_uninstall() {
+  cmd_stop || true
+  local kind="\$(backend_kind)"
+  case "\$kind" in
+    docker)
+      docker rm -f plugsky-web >/dev/null 2>&1 || true
+      docker volume rm open-webui-data >/dev/null 2>&1 || true
+      ;;
+  esac
+  rm -rf "\$CONFIG_DIR"
+  for rc in "\$HOME/.zshrc" "\$HOME/.bashrc"; do
+    [ -f "\$rc" ] && sed -i.bak '/\.plugsky-web\/bin/d' "\$rc" 2>/dev/null || true
+  done
+  ok "Removed \$CONFIG_DIR. Restart your terminal."
+}
+
+print_help() {
+  cat <<HELP
+\${BOLD}plugsky-web\${NC} — manage a self-hosted Open WebUI for Plugsky
+
+Usage:
+  plugsky-web <command>
+
+Commands:
+  \${CYAN}start\${NC}                  Start the server (background) and open browser
+  \${CYAN}stop\${NC}                   Stop the server
+  \${CYAN}restart\${NC}                Stop + start
+  \${CYAN}status\${NC}                 Is it running? On which port?
+  \${CYAN}logs\${NC} [N]               Tail last N lines of logs (default: 50)
+  \${CYAN}open\${NC}                   Open http://localhost:\$PORT in your browser
+  \${CYAN}update\${NC}                 Pull latest image (Docker) or upgrade package (pip)
+  \${CYAN}uninstall\${NC}              Remove everything (data + container + venv)
+
+Docs:    https://plugsky.com/docs/web
+Status:  https://plugsky.com/status
+HELP
+}
+
+case "\$BACKEND" in
+  start)            cmd_start ;;
+  stop)             cmd_stop ;;
+  restart)          cmd_restart ;;
+  status)           cmd_status ;;
+  logs)             cmd_logs "\${1:-50}" ;;
+  open)             cmd_open ;;
+  update)           cmd_update ;;
+  uninstall)        cmd_uninstall ;;
+  -h|--help|help|"") print_help ;;
+  *) err "Unknown command: \$BACKEND"; print_help; exit 1 ;;
+esac
+SHIM
+  chmod +x "$PLUGSKY_BIN/plugsky-web"
+  echo -e "${GREEN}  ✓ Installed shim to $PLUGSKY_BIN/plugsky-web${NC}"
+}
+
+write_welcome() {
+  cat > "$PLUGSKY_HOME/WELCOME.txt" <<'EOF'
+╔══════════════════════════════════════════════════════════════════╗
+║                     Welcome to Plugsky Web                      ║
+║       Self-hosted AI chat UI powered by Open WebUI + Plugsky   ║
+╚══════════════════════════════════════════════════════════════════╝
+
+  Quick start:
+
+    1. Set your API key (one time):
+         export PLUGSKY_API_KEY=sk-live-...
+       Or pass --api-key sk-live-... to the installer.
+
+    2. Start the server:
+         plugsky-web start
+
+       This runs Open WebUI in the background and opens
+       http://localhost:8080 in your browser.
+
+    3. Create an account on first visit
+       (this is the Open WebUI sign-up page — first user becomes admin).
+
+    4. Pick a model and chat:
+         plugsky-pro        (default — coding, reasoning, vision)
+         plugsky-max        (frontier-class, very strong)
+         plugsky-frontier   (long context 128k, reliable)
+         plugsky-micro      (free, fast — trivial edits)
+         ... and 27 more at https://plugsky.com/docs#models
+
+  Commands:
+    plugsky-web start                Start the server
+    plugsky-web stop                 Stop the server
+    plugsky-web restart              Reload (e.g. after config change)
+    plugsky-web status               Is it running? On which port?
+    plugsky-web logs [N]             Tail last N lines of logs
+    plugsky-web open                 Open the URL in your browser
+    plugsky-web update               Pull latest image (Docker) or upgrade (pip)
+    plugsky-web uninstall            Remove everything
+
+  Data location:
+    Docker:  'open-webui-data' volume (visible via 'docker volume ls')
+    pip:     ~/.plugsky-web/data/   (chats, accounts, settings)
+
+  All 31 Plugsky models are pre-listed. To customize which ones show up
+  in the model picker, edit ~/.plugsky-web/.env and set DEFAULT_MODELS
+  to a comma-separated list, then 'plugsky-web restart'.
+
+  Docs:    https://plugsky.com/docs/web
+  Status:  https://plugsky.com/status
+  Get key: https://plugsky.com/dashboard
+EOF
+  echo -e "${GREEN}  ✓ Wrote $PLUGSKY_HOME/WELCOME.txt${NC}"
+}
+
+add_to_path() {
+  local rc_file="$1"
+  local line='export PATH="$HOME/.plugsky-web/bin:$PATH"'
+  if [ -f "$rc_file" ] && grep -qF '.plugsky-web/bin' "$rc_file"; then
+    return 0
+  fi
+  if [ -f "$rc_file" ]; then
+    printf '\n# Plugsky Web\n%s\n' "$line" >> "$rc_file"
+  else
+    printf '%s\n' "$line" > "$rc_file"
+  fi
+  echo -e "${GREEN}  ✓ Added ~/.plugsky-web/bin to PATH in $rc_file${NC}"
+}
+
+install() {
+  echo
+  logo
+  echo
+  echo -e "${BOLD}Installing Plugsky Web v${PLUGSKY_VERSION}${NC}"
+  echo
+
+  local os
+  os=$(detect_os)
+  echo -e "${MUTED}Detected: $os${NC}"
+
+  mkdir -p "$PLUGSKY_HOME"
+
+  local backend
+  backend=$(detect_backend)
+  if [ "$backend" = "none" ]; then
+    echo -e "${ORANGE}No usable backend found.${NC}" >&2
+    check_docker || true
+    echo -e "${ORANGE}Need ONE of:${NC}" >&2
+    echo -e "${ORANGE}  - Docker (Docker Desktop / dockerd)${NC}" >&2
+    echo -e "${ORANGE}  - Python 3.11+${NC}" >&2
+    exit 1
+  fi
+  echo -e "${MUTED}Backend:  $backend${NC}"
+  echo "$backend" > "$BACKEND_CHOICE_FILE"
+
+  case "$backend" in
+    docker) write_docker_pull ;;
+    pip)    write_pip_install ;;
+  esac
+
+  write_shim
+  write_env "${PLUGSKY_API_KEY:-}"
+  write_welcome
+
+  if [ "${NO_MODIFY_PATH:-false}" = "true" ]; then
+    echo -e "${MUTED}Skipped modifying shell rc (--no-modify-path)${NC}"
+  else
+    case "$os" in
+      darwin|linux)
+        [ -f "$HOME/.zshrc" ] && add_to_path "$HOME/.zshrc"
+        [ -f "$HOME/.bashrc" ] && add_to_path "$HOME/.bashrc"
+        ;;
+      windows) ;;
+    esac
+  fi
+
+  echo
+  echo -e "${BOLD}${GREEN}Plugsky Web v${PLUGSKY_VERSION} installed!${NC}"
+  echo
+  echo -e "  ${CYAN}Next steps:${NC}"
+  echo -e "    1. ${BOLD}Restart your terminal${NC} (or: ${MUTED}source ~/.zshrc${NC})"
+  echo -e "    2. Get a key: ${CYAN}https://plugsky.com/dashboard${NC}"
+  echo -e "    3. Set it:    ${MUTED}export PLUGSKY_API_KEY=sk-live-…${NC}"
+  echo -e "    4. Run:       ${MUTED}plugsky-web start${NC}"
+  echo -e "    5. Open:      ${CYAN}http://localhost:$PLUGSKY_PORT${NC}"
+  echo
+}
+
+uninstall() {
+  echo -e "${ORANGE}Stopping and removing Plugsky Web (data: $PLUGSKY_HOME)…${NC}"
+  if [ -x "$PLUGSKY_BIN/plugsky-web" ]; then
+    "$PLUGSKY_BIN/plugsky-web" uninstall || true
+  else
+    # Fallback if the shim was deleted
+    if command -v docker >/dev/null 2>&1; then
+      docker stop plugsky-web >/dev/null 2>&1 || true
+      docker rm -f plugsky-web >/dev/null 2>&1 || true
+      docker volume rm open-webui-data >/dev/null 2>&1 || true
+    fi
+    rm -rf "$PLUGSKY_HOME"
+    for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
+      [ -f "$rc" ] && sed -i.bak '/\.plugsky-web\/bin/d' "$rc" 2>/dev/null || true
+    done
+    echo -e "${GREEN}  ✓ Removed. Restart your terminal.${NC}"
+  fi
+}
+
+NO_MODIFY_PATH=false
+PLUGSKY_API_KEY=""
+FORCE_BACKEND=""
+PLUGSKY_PORT_OVERRIDE=""
+ACTION="install"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -v|--version) PLUGSKY_VERSION="$2"; shift 2 ;;
+    --no-modify-path) NO_MODIFY_PATH=true; shift ;;
+    --api-key) PLUGSKY_API_KEY="$2"; shift 2 ;;
+    --backend) FORCE_BACKEND="$2"; shift 2 ;;
+    --port) PLUGSKY_PORT_OVERRIDE="$2"; shift 2 ;;
+    --python) FORCE_PYTHON="$2"; shift 2 ;;
+    --uninstall) ACTION="uninstall"; shift ;;
+    --) shift ;;  # end of options
+    *) echo -e "${ORANGE}Warning: unknown option '$1'${NC}" >&2; shift ;;
+  esac
+done
+
+[ -n "$PLUGSKY_PORT_OVERRIDE" ] && PLUGSKY_PORT="$PLUGSKY_PORT_OVERRIDE"
+
+case "$ACTION" in
+  install) install ;;
+  uninstall) uninstall ;;
+esac
